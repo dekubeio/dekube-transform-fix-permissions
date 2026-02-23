@@ -86,13 +86,14 @@ def _extract_data_paths(compose_svc, volume_root):
     return paths
 
 
-class FixPermissions:
+class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one class, one method
     """Generate a fix-permissions service for non-root bind-mounted volumes."""
 
     name = "fix-permissions"
     priority = 8000  # after everything that touches volumes
 
-    def transform(self, compose_services, ingress_entries, ctx):
+    def transform(self, compose_services, ingress_entries, ctx):  # pylint: disable=unused-argument  # Transform contract signature
+        """Generate fix-permissions service for non-root bind-mounted volumes."""
         uids = _collect_uids(ctx.manifests)
         if not uids:
             return
