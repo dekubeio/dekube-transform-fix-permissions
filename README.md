@@ -4,7 +4,7 @@
 ![python 3](https://img.shields.io/badge/python-3-3776AB)
 ![heresy: 3/10](https://img.shields.io/badge/heresy-3%2F10-blueviolet)
 
-h2c transform that generates a `fix-permissions` busybox service for non-root containers with bind-mounted volumes. **The Custodian** — the 8th monk.
+dekube transform that generates a `fix-permissions` busybox service for non-root containers with bind-mounted volumes. **The Custodian** — the 8th monk.
 
 > Heresy level: 3/10 — rewrites filesystem ownership behind the user's back. Not malicious, but presumptuous.
 
@@ -28,10 +28,10 @@ Every chown is logged to stderr for transparency.
 
 Built into the helmfile2compose distribution — no install needed.
 
-Via [h2c-manager](https://github.com/helmfile2compose/h2c-manager):
+Via [dekube-manager](https://github.com/dekubeio/dekube-manager):
 
 ```bash
-python3 h2c-manager.py fix-permissions
+python3 dekube-manager.py fix-permissions
 ```
 
 ## Priority
