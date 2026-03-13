@@ -81,7 +81,7 @@ def _extract_data_paths(compose_svc, volume_root):
     for vol in compose_svc.get("volumes") or []:
         if isinstance(vol, str) and _is_bind_mount(vol):
             host_path = vol.split(":")[0]
-            if host_path.startswith(volume_root):
+            if host_path == volume_root or host_path.startswith(volume_root + "/"):
                 paths.add(host_path)
     return paths
 
