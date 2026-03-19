@@ -10,7 +10,7 @@ Runs late (priority 8000) so it sees volumes after all other transforms
 
 import sys
 
-_WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "StatefulSet")
+_WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "Pod", "StatefulSet")
 
 
 def _log(msg):
@@ -37,7 +37,10 @@ def _collect_uids(manifests):
         for m in manifests.get(kind, []):
             name = (m.get("metadata") or {}).get("name", "unknown")
             spec = (m.get("spec") or {})
-            pod_spec = ((spec.get("template") or {}).get("spec") or {})
+            if kind == "Pod":
+                pod_spec = spec
+            else:
+                pod_spec = ((spec.get("template") or {}).get("spec") or {})
             containers = pod_spec.get("containers") or []
 
             # Main container
