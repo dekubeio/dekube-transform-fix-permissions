@@ -41,6 +41,8 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
         uids = {}
         for kind in _WORKLOAD_KINDS:
             for m in manifests.get(kind, []):
+                if not m:
+                    continue
                 name = (m.get("metadata") or {}).get("name", "unknown")
                 spec = (m.get("spec") or {})
                 if kind == "Pod":
@@ -50,13 +52,15 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
                 containers = pod_spec.get("containers") or []
 
                 # Main container
-                if containers:
+                if containers and containers[0]:
                     uid = FixPermissions._get_run_as_user(pod_spec, containers[0])
                     if uid and uid > 0:
                         uids[name] = (uid, containers[0].get("image", ""))
 
                 # Sidecar containers (containers[1:])
                 for sc in containers[1:]:
+                    if not sc:
+                        continue
                     sc_name = sc.get("name", "sidecar")
                     svc_name = f"{name}-sidecar-{sc_name}"
                     uid = FixPermissions._get_run_as_user(pod_spec, sc)
@@ -65,6 +69,8 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
 
                 # Init containers
                 for ic in pod_spec.get("initContainers") or []:
+                    if not ic:
+                        continue
                     ic_name = ic.get("name", "init")
                     svc_name = f"{name}-init-{ic_name}"
                     uid = FixPermissions._get_run_as_user(pod_spec, ic)
