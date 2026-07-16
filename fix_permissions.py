@@ -32,6 +32,36 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
         return None
 
     @staticmethod
+    def _iter_workloads(manifests):
+        """Yield (workload_name, pod_spec) for every workload manifest."""
+        for kind in _WORKLOAD_KINDS:
+            for m in manifests.get(kind, []):
+                if not m:
+                    continue
+                name = (m.get("metadata") or {}).get("name", "unknown")
+                spec = m.get("spec") or {}
+                pod_spec = spec if kind == "Pod" else (spec.get("template") or {}).get("spec") or {}
+                yield name, pod_spec
+
+    @staticmethod
+    def _iter_named_containers(name, pod_spec):
+        """Yield (compose_service_name, container) for main, sidecar and init containers.
+
+        Naming matches the workload converter: main -> workload name,
+        sidecar -> "<name>-sidecar-<cname>" (containers[1:]),
+        init -> "<name>-init-<cname>".
+        """
+        containers = pod_spec.get("containers") or []
+        if containers and containers[0]:
+            yield name, containers[0]
+        for sc in containers[1:]:
+            if sc:
+                yield f"{name}-sidecar-{sc.get('name', 'sidecar')}", sc
+        for ic in pod_spec.get("initContainers") or []:
+            if ic:
+                yield f"{name}-init-{ic.get('name', 'init')}", ic
+
+    @staticmethod
     def _collect_uids(manifests):
         """Scan workload manifests and return {service_name: (uid, image)} for non-root containers.
 
@@ -39,44 +69,11 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
         naming conventions as the workload converter.
         """
         uids = {}
-        for kind in _WORKLOAD_KINDS:
-            for m in manifests.get(kind, []):
-                if not m:
-                    continue
-                name = (m.get("metadata") or {}).get("name", "unknown")
-                spec = (m.get("spec") or {})
-                if kind == "Pod":
-                    pod_spec = spec
-                else:
-                    pod_spec = ((spec.get("template") or {}).get("spec") or {})
-                containers = pod_spec.get("containers") or []
-
-                # Main container
-                if containers and containers[0]:
-                    uid = FixPermissions._get_run_as_user(pod_spec, containers[0])
-                    if uid and uid > 0:
-                        uids[name] = (uid, containers[0].get("image", ""))
-
-                # Sidecar containers (containers[1:])
-                for sc in containers[1:]:
-                    if not sc:
-                        continue
-                    sc_name = sc.get("name", "sidecar")
-                    svc_name = f"{name}-sidecar-{sc_name}"
-                    uid = FixPermissions._get_run_as_user(pod_spec, sc)
-                    if uid and uid > 0:
-                        uids[svc_name] = (uid, sc.get("image", ""))
-
-                # Init containers
-                for ic in pod_spec.get("initContainers") or []:
-                    if not ic:
-                        continue
-                    ic_name = ic.get("name", "init")
-                    svc_name = f"{name}-init-{ic_name}"
-                    uid = FixPermissions._get_run_as_user(pod_spec, ic)
-                    if uid and uid > 0:
-                        uids[svc_name] = (uid, ic.get("image", ""))
-
+        for name, pod_spec in FixPermissions._iter_workloads(manifests):
+            for svc_name, container in FixPermissions._iter_named_containers(name, pod_spec):
+                uid = FixPermissions._get_run_as_user(pod_spec, container)
+                if uid and uid > 0:
+                    uids[svc_name] = (uid, container.get("image", ""))
         return uids
 
     @staticmethod
