@@ -8,9 +8,7 @@ Runs late (priority 8000) so it sees volumes after all other transforms
 (bitnami, flatten-internal-urls, etc.) have done their work.
 """
 
-import sys
-
-_WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "Pod", "StatefulSet")
+from dekube import iter_workloads, iter_named_containers, log  # pylint: disable=import-error
 
 
 class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one class, one method
@@ -18,9 +16,6 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
 
     name = "fix-permissions"
     priority = 8000  # after everything that touches volumes
-
-    def _log(self, msg):
-        print(f"  [{self.name}] {msg}", file=sys.stderr)
 
     @staticmethod
     def _get_run_as_user(pod_spec, container):
@@ -32,36 +27,6 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
         return None
 
     @staticmethod
-    def _iter_workloads(manifests):
-        """Yield (workload_name, pod_spec) for every workload manifest."""
-        for kind in _WORKLOAD_KINDS:
-            for m in manifests.get(kind, []):
-                if not m:
-                    continue
-                name = (m.get("metadata") or {}).get("name", "unknown")
-                spec = m.get("spec") or {}
-                pod_spec = spec if kind == "Pod" else (spec.get("template") or {}).get("spec") or {}
-                yield name, pod_spec
-
-    @staticmethod
-    def _iter_named_containers(name, pod_spec):
-        """Yield (compose_service_name, container) for main, sidecar and init containers.
-
-        Naming matches the workload converter: main -> workload name,
-        sidecar -> "<name>-sidecar-<cname>" (containers[1:]),
-        init -> "<name>-init-<cname>".
-        """
-        containers = pod_spec.get("containers") or []
-        if containers and containers[0]:
-            yield name, containers[0]
-        for sc in containers[1:]:
-            if sc:
-                yield f"{name}-sidecar-{sc.get('name', 'sidecar')}", sc
-        for ic in pod_spec.get("initContainers") or []:
-            if ic:
-                yield f"{name}-init-{ic.get('name', 'init')}", ic
-
-    @staticmethod
     def _collect_uids(manifests):
         """Scan workload manifests and return {service_name: (uid, image)} for non-root containers.
 
@@ -69,8 +34,8 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
         naming conventions as the workload converter.
         """
         uids = {}
-        for name, pod_spec in FixPermissions._iter_workloads(manifests):
-            for svc_name, container in FixPermissions._iter_named_containers(name, pod_spec):
+        for name, pod_spec in iter_workloads(manifests):
+            for svc_name, container in iter_named_containers(name, pod_spec):
                 uid = FixPermissions._get_run_as_user(pod_spec, container)
                 if uid and uid > 0:
                     uids[svc_name] = (uid, container.get("image", ""))
@@ -121,7 +86,7 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
             elif svc.get("image", "") == manifest_image:
                 uids[svc_name] = manifest_uid
             else:
-                self._log(f"{svc_name}: image changed, skipping (manifest UID {manifest_uid} no longer reliable)")
+                log(self.name, f"{svc_name}: image changed, skipping (manifest UID {manifest_uid} no longer reliable)")
 
         if not uids:
             return
@@ -150,4 +115,4 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
 
         for uid, paths in sorted(by_uid.items()):
             for path in sorted(paths):
-                self._log(f"chown -R {uid} {path}")
+                log(self.name, f"chown -R {uid} {path}")
