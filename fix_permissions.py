@@ -142,9 +142,12 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
 
         No uid chown when only fsGroup is set — matches K8s (`volume_linux.go`
         `changeFilePermission`: ``Lchown(path, -1, fsGroup)``, never touches uid).
-        Setgid on directories is applied whenever gid is set (uid+gid or gid-only),
-        matching K8s's own `ModeSetgid` on every fsGroup-managed directory, so files
-        later created by the app inherit the group.
+        ``g+rwX`` and setgid on directories are applied whenever gid is set — uid+gid
+        or gid-only — matching K8s, which ORs in the rw-rw---- bits and sets
+        `ModeSetgid` unconditionally whenever fsGroup applies, not only when there's
+        no runAsUser. Without this, a second container (e.g. a sidecar) with a
+        *different* runAsUser sharing the same fsGroup-managed volume can still be
+        locked out after a same-path chown from another owner overwrites the mode.
         """
         steps = []
         if uid is not None and gid is not None:
@@ -153,8 +156,8 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
             steps.append(f"chown -R {uid} {mount_path}")
         else:
             steps.append(f"chgrp -R {gid} {mount_path}")
-            steps.append(f"chmod -R g+rwX {mount_path}")
         if gid is not None:
+            steps.append(f"chmod -R g+rwX {mount_path}")
             steps.append(f"find {mount_path} -type d -exec chmod g+s {{}} +")
         return steps
 
