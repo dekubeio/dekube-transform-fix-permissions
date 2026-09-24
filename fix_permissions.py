@@ -3,8 +3,11 @@
 Scans K8s manifests for non-root containers (securityContext.runAsUser) and
 pod-level fsGroup, then inspects final compose service volumes for bind
 mounts and named volumes. Generates a busybox service that chowns/chgrps
-them to the correct owner, and wires a completion-gated ``depends_on`` from
-every service it fixes so compose can't race the chown on first start.
+them to the correct owner (plus setgid on directories and a ``group_add`` on
+the fixed service when fsGroup is set — same as K8s), and wires a
+completion-gated ``depends_on`` from every service it fixes so compose can't
+race the chown on first start. A single failed path only warns (the fixer
+script always exits 0), so one bad mount doesn't block every other service.
 
 Runs late (priority 8000) so it sees volumes after all other transforms
 (bitnami, flatten-internal-urls, etc.) have done their work.
@@ -121,6 +124,40 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
         uid, gid = owner
         return (uid is None, uid or 0, gid is None, gid or 0)
 
+    @staticmethod
+    def _add_group(svc, gid):
+        """Add gid to the service's ``group_add`` list (merging with any existing entries).
+
+        Emulates K8s: a pod with fsGroup runs every container with that GID as a
+        supplementary group (in addition to its own uid/primary gid) — that's how a
+        non-root process can write to a volume it doesn't otherwise own.
+        """
+        existing = svc.get("group_add") or []
+        if str(gid) not in [str(g) for g in existing]:
+            svc["group_add"] = list(existing) + [str(gid)]
+
+    @staticmethod
+    def _fix_commands(uid, gid, mount_path):
+        """Build the shell steps that fix ownership/group/setgid for one mount path.
+
+        No uid chown when only fsGroup is set — matches K8s (`volume_linux.go`
+        `changeFilePermission`: ``Lchown(path, -1, fsGroup)``, never touches uid).
+        Setgid on directories is applied whenever gid is set (uid+gid or gid-only),
+        matching K8s's own `ModeSetgid` on every fsGroup-managed directory, so files
+        later created by the app inherit the group.
+        """
+        steps = []
+        if uid is not None and gid is not None:
+            steps.append(f"chown -R {uid}:{gid} {mount_path}")
+        elif uid is not None:
+            steps.append(f"chown -R {uid} {mount_path}")
+        else:
+            steps.append(f"chgrp -R {gid} {mount_path}")
+            steps.append(f"chmod -R g+rwX {mount_path}")
+        if gid is not None:
+            steps.append(f"find {mount_path} -type d -exec chmod g+s {{}} +")
+        return steps
+
     def transform(self, compose_services, ingress_entries, ctx):  # pylint: disable=unused-argument  # Transform contract signature
         """Generate fix-permissions service for non-root bind-mounted/named volumes."""
         manifest_owners = self._collect_owners(ctx.manifests)
@@ -130,23 +167,27 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
         volume_root = ctx.config.get("volume_root", "./data")
 
         # Resolve effective (uid, gid) per service:
-        # 1. compose user: field wins for uid (explicit, set by user or transform)
-        # 2. manifest uid used only if image hasn't changed (no transform swap)
-        # 3. fsGroup always carried through — it's a pod-level K8s ownership fact,
-        #    independent of any per-container user override
+        # 1. compose user: field wins for uid (explicit, set by user or transform) —
+        #    an explicit override is authoritative regardless of any image swap
+        # 2. manifest uid/gid used only if image hasn't changed (no transform swap):
+        #    both belonged to the ORIGINAL container image, so a swap invalidates
+        #    both together, not just the uid
         owners: dict[str, tuple[int | None, int | None]] = {}
         for svc_name, (manifest_uid, gid, manifest_image) in manifest_owners.items():
             svc = compose_services.get(svc_name)
             if not svc:
                 continue
-            uid = manifest_uid
             user = svc.get("user")
             if user is not None:
                 parsed_uid = int(str(user).split(":")[0])  # "1000" or "1000:1000"
                 uid = parsed_uid if parsed_uid > 0 else None
-            elif manifest_uid is not None and svc.get("image", "") != manifest_image:
-                log(self.name, f"{svc_name}: image changed, skipping (manifest UID {manifest_uid} no longer reliable)")
+            elif svc.get("image", "") != manifest_image:
+                log(self.name, f"{svc_name}: image changed, skipping "
+                               f"(manifest UID {manifest_uid} and fsGroup {gid} no longer reliable)")
                 uid = None
+                gid = None
+            else:
+                uid = manifest_uid
             if uid is not None or gid is not None:
                 owners[svc_name] = (uid, gid)
 
@@ -166,31 +207,35 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
         if not by_owner:
             return
 
-        chown_cmds = []
+        # CBA: a failed path only warns (the script always exits 0) so one bad mount
+        # (e.g. an NFS root_squash named volume passed through dekube.yaml) doesn't
+        # block every other fixed service waiting on service_completed_successfully.
+        # A real failure signal would need a status file dependents could check —
+        # parked until someone actually needs that guarantee.
+        fix_cmds = []
         volumes = []
         for (uid, gid), paths in sorted(by_owner.items(), key=lambda kv: self._owner_sort_key(kv[0])):
             mount_paths = [f"/fixperm/{i}" for i in range(len(volumes), len(volumes) + len(paths))]
-            targets = " ".join(mount_paths)
-            if uid is not None and gid is not None:
-                chown_cmds.append(f"chown -R {uid}:{gid} {targets}")
-            elif uid is not None:
-                chown_cmds.append(f"chown -R {uid} {targets}")
-            else:
-                chown_cmds.append(f"chgrp -R {gid} {targets} && chmod -R g+rwX {targets}")
             for host_path, mount_path in zip(sorted(paths), mount_paths):
                 volumes.append(f"{host_path}:{mount_path}")
+                step = " && ".join(self._fix_commands(uid, gid, mount_path))
+                fix_cmds.append(f"({step}) || echo 'WARNING: [fix-permissions] failed for {mount_path}' >&2")
 
         compose_services["fix-permissions"] = {
             "image": "busybox", "restart": "no", "user": "0",
-            "command": ["sh", "-c", " && ".join(chown_cmds)],
+            "command": ["sh", "-c", " ; ".join(fix_cmds) + " ; exit 0"],
             "volumes": volumes,
         }
 
         for svc_name in sorted(fixed_services):
-            self._add_completion_dependency(compose_services[svc_name], "fix-permissions")
+            svc = compose_services[svc_name]
+            self._add_completion_dependency(svc, "fix-permissions")
+            _, gid = owners[svc_name]
+            if gid is not None:
+                self._add_group(svc, gid)
 
         for (uid, gid), paths in sorted(by_owner.items(), key=lambda kv: self._owner_sort_key(kv[0])):
             owner_desc = f"{uid}:{gid}" if uid is not None and gid is not None else (
                 f"uid {uid}" if uid is not None else f"gid {gid}")
             for path in sorted(paths):
-                log(self.name, f"chown {owner_desc} {path}")
+                log(self.name, f"fix ownership ({owner_desc}) on {path}")
