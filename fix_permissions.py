@@ -161,20 +161,16 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
             steps.append(f"find {mount_path} -type d -exec chmod g+s {{}} +")
         return steps
 
-    def transform(self, compose_services, ingress_entries, ctx):  # pylint: disable=unused-argument  # Transform contract signature
-        """Generate fix-permissions service for non-root bind-mounted/named volumes."""
-        manifest_owners = self._collect_owners(ctx.manifests)
-        if not manifest_owners:
-            return
+    @staticmethod
+    def _resolve_owners(manifest_owners, compose_services, log_name):
+        """Resolve effective (uid, gid) per service:
 
-        volume_root = ctx.config.get("volume_root", "./data")
-
-        # Resolve effective (uid, gid) per service:
-        # 1. compose user: field wins for uid (explicit, set by user or transform) —
-        #    an explicit override is authoritative regardless of any image swap
-        # 2. manifest uid/gid used only if image hasn't changed (no transform swap):
-        #    both belonged to the ORIGINAL container image, so a swap invalidates
-        #    both together, not just the uid
+        1. compose user: field wins for uid (explicit, set by user or transform) —
+           an explicit override is authoritative regardless of any image swap
+        2. manifest uid/gid used only if image hasn't changed (no transform swap):
+           both belonged to the ORIGINAL container image, so a swap invalidates
+           both together, not just the uid
+        """
         owners: dict[str, tuple[int | None, int | None]] = {}
         for svc_name, (manifest_uid, gid, manifest_image) in manifest_owners.items():
             svc = compose_services.get(svc_name)
@@ -185,60 +181,94 @@ class FixPermissions:  # pylint: disable=too-few-public-methods  # contract: one
                 parsed_uid = int(str(user).split(":")[0])  # "1000" or "1000:1000"
                 uid = parsed_uid if parsed_uid > 0 else None
             elif svc.get("image", "") != manifest_image:
-                log(self.name, f"{svc_name}: image changed, skipping "
-                               f"(manifest UID {manifest_uid} and fsGroup {gid} no longer reliable)")
+                log(log_name, f"{svc_name}: image changed, skipping "
+                              f"(manifest UID {manifest_uid} and fsGroup {gid} no longer reliable)")
                 uid = None
                 gid = None
             else:
                 uid = manifest_uid
             if uid is not None or gid is not None:
                 owners[svc_name] = (uid, gid)
+        return owners
 
-        if not owners:
-            return
+    @staticmethod
+    def _group_by_owner(owners, compose_services, volume_root):
+        """Group services by (uid, gid) and collect the data paths each owner touches.
 
+        A service with a resolved owner but no data paths under volume_root is not
+        "fixed" — nothing there for the fix-permissions service to chown.
+        """
         by_owner = {}
         fixed_services = set()
         for svc_name, owner in sorted(owners.items()):
-            data_paths = sorted(self._extract_data_paths(compose_services[svc_name], volume_root))
+            data_paths = sorted(FixPermissions._extract_data_paths(compose_services[svc_name], volume_root))
             if not data_paths:
                 continue
             fixed_services.add(svc_name)
             for path in data_paths:
                 by_owner.setdefault(owner, set()).add(path)
+        return by_owner, fixed_services
 
-        if not by_owner:
-            return
+    @staticmethod
+    def _build_fix_service(by_owner):
+        """Build the fix-permissions busybox service: bind-mount every owner's data
+        paths under /fixperm/<i> and chown/chgrp/setgid each of them.
 
-        # CBA: a failed path only warns (the script always exits 0) so one bad mount
-        # (e.g. an NFS root_squash named volume passed through dekube.yaml) doesn't
-        # block every other fixed service waiting on service_completed_successfully.
-        # A real failure signal would need a status file dependents could check —
-        # parked until someone actually needs that guarantee.
+        CBA: a failed path only warns (the script always exits 0) so one bad mount
+        (e.g. an NFS root_squash named volume passed through dekube.yaml) doesn't
+        block every other fixed service waiting on service_completed_successfully.
+        A real failure signal would need a status file dependents could check —
+        parked until someone actually needs that guarantee.
+        """
         fix_cmds = []
         volumes = []
-        for (uid, gid), paths in sorted(by_owner.items(), key=lambda kv: self._owner_sort_key(kv[0])):
+        for (uid, gid), paths in sorted(by_owner.items(), key=lambda kv: FixPermissions._owner_sort_key(kv[0])):
             mount_paths = [f"/fixperm/{i}" for i in range(len(volumes), len(volumes) + len(paths))]
             for host_path, mount_path in zip(sorted(paths), mount_paths):
                 volumes.append(f"{host_path}:{mount_path}")
-                step = " && ".join(self._fix_commands(uid, gid, mount_path))
+                step = " && ".join(FixPermissions._fix_commands(uid, gid, mount_path))
                 fix_cmds.append(f"({step}) || echo 'WARNING: [fix-permissions] failed for {mount_path}' >&2")
-
-        compose_services["fix-permissions"] = {
+        return {
             "image": "busybox", "restart": "no", "user": "0",
             "command": ["sh", "-c", " ; ".join(fix_cmds) + " ; exit 0"],
             "volumes": volumes,
         }
 
+    @staticmethod
+    def _wire_fixed_services(compose_services, fixed_services, owners):
+        """Add the completion-gated depends_on (and group_add for fsGroup) to every
+        service the fix-permissions service was built for."""
         for svc_name in sorted(fixed_services):
             svc = compose_services[svc_name]
-            self._add_completion_dependency(svc, "fix-permissions")
+            FixPermissions._add_completion_dependency(svc, "fix-permissions")
             _, gid = owners[svc_name]
             if gid is not None:
-                self._add_group(svc, gid)
+                FixPermissions._add_group(svc, gid)
 
-        for (uid, gid), paths in sorted(by_owner.items(), key=lambda kv: self._owner_sort_key(kv[0])):
+    @staticmethod
+    def _log_fixes(by_owner, log_name):
+        """Log one line per (owner, path) fixed, in the same order they were applied."""
+        for (uid, gid), paths in sorted(by_owner.items(), key=lambda kv: FixPermissions._owner_sort_key(kv[0])):
             owner_desc = f"{uid}:{gid}" if uid is not None and gid is not None else (
                 f"uid {uid}" if uid is not None else f"gid {gid}")
             for path in sorted(paths):
-                log(self.name, f"fix ownership ({owner_desc}) on {path}")
+                log(log_name, f"fix ownership ({owner_desc}) on {path}")
+
+    def transform(self, compose_services, ingress_entries, ctx):  # pylint: disable=unused-argument  # Transform contract signature
+        """Generate fix-permissions service for non-root bind-mounted/named volumes."""
+        manifest_owners = self._collect_owners(ctx.manifests)
+        if not manifest_owners:
+            return
+
+        volume_root = ctx.config.get("volume_root", "./data")
+        owners = self._resolve_owners(manifest_owners, compose_services, self.name)
+        if not owners:
+            return
+
+        by_owner, fixed_services = self._group_by_owner(owners, compose_services, volume_root)
+        if not by_owner:
+            return
+
+        compose_services["fix-permissions"] = self._build_fix_service(by_owner)
+        self._wire_fixed_services(compose_services, fixed_services, owners)
+        self._log_fixes(by_owner, self.name)
