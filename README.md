@@ -16,13 +16,14 @@ In Kubernetes, init containers or the kubelet handle this. In compose, someone h
 
 ## What it does
 
-1. Scans K8s manifests for containers with `securityContext.runAsUser` (container-level takes precedence over pod-level)
-2. Inspects the **final** compose service volumes for bind mounts (`./`, `../`, `/` prefixes)
-3. Generates a single `fix-permissions` service that runs `chown -R <uid>` as root
+1. Scans K8s manifests for containers with `securityContext.runAsUser` (container-level takes precedence over pod-level) and for pod-level `securityContext.fsGroup` — K8s recursively chgrps volumes to `fsGroup` and makes them group-writable, so a pod can need fixing even with no `runAsUser` at all
+2. Inspects the **final** compose service volumes for bind mounts (`./`, `../`, `/` prefixes) and named (docker-managed) volumes
+3. Generates a single `fix-permissions` service that runs `chown -R <uid>[:<gid>]` (or `chgrp`+`chmod g+rwX` when only `fsGroup` applies) as root
+4. Adds `depends_on: {fix-permissions: {condition: service_completed_successfully}}` to every service it fixes, so compose can't start it before the chown/chgrp finishes
 
 Runs at priority 8000 — after everything that touches volumes (bitnami at 1500, flatten-internal-urls at 2000). This ensures it sees the final volume layout, including any rewrites from other transforms.
 
-Every chown is logged to stderr for transparency.
+Every chown/chgrp is logged to stderr for transparency.
 
 ## Install
 
